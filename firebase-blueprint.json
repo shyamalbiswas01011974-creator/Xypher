@@ -1,0 +1,132 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private Google-authenticated Xypher user account profile (PII strictly owner-only).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "primaryXyphAddress": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "primaryEvmAddress": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lastSignInAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "email",
+        "displayName",
+        "photoURL",
+        "primaryXyphAddress",
+        "primaryEvmAddress",
+        "createdAt",
+        "updatedAt",
+        "lastSignInAt"
+      ]
+    },
+    "LinkedWallet": {
+      "title": "LinkedWallet",
+      "description": "Public address bookmark linked to a user's Google account (never stores private keys or WIFs).",
+      "type": "object",
+      "properties": {
+        "walletId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "xyphAddress": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "evmAddress": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "walletType": {
+          "type": "string",
+          "enum": ["local", "metamask", "solana"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "walletId",
+        "ownerUid",
+        "label",
+        "xyphAddress",
+        "evmAddress",
+        "walletType",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserProfile"
+      },
+      "description": "Private Google-authenticated user profile documents containing email and primary public addresses."
+    },
+    "/users/{userId}/wallets/{walletId}": {
+      "schema": {
+        "$ref": "#/entities/LinkedWallet"
+      },
+      "description": "Owner-only public wallet address bookmarks linked to the user's Google account."
+    }
+  }
+}

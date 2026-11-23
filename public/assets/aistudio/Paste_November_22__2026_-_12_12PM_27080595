@@ -1,0 +1,2121 @@
+#!/usr/bin/env python3
+"""Xypher (XYPH) — single-file node, CLI wallet, desktop wallet, web wallet.
+
+    python xypher.py selftest
+    python xypher.py init && python xypher.py address new
+    python xypher.py node                 # chain + P2P + RPC + web wallet
+    python xypher.py wallet               # Tkinter wallet
+    python xypher.py webwallet            # open the browser wallet
+
+Environment:
+    XYPH_DATA      node data directory (default ./xypher-data)
+    XYPH_PROFILE   "main" (default) or "fast" for 15s dev blocks
+    XYPH_MATURITY  coinbase maturity, default 100 (5 on the fast profile)
+"""
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import queue
+import shutil
+import socket
+import struct
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import webbrowser
+from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# =====================================================================
+# CONSENSUS PARAMETERS
+# =====================================================================
+NAME, SYMBOL, DECIMALS = "Xypher", "XYPH", 8
+UNIT = 10 ** DECIMALS
+PROFILE = os.environ.get("XYPH_PROFILE", "main")
+
+if PROFILE == "fast":
+    TARGET_BLOCK_TIME, RETARGET_INTERVAL, HALVING_INTERVAL = 15, 32, 5_250
+else:
+    TARGET_BLOCK_TIME, RETARGET_INTERVAL, HALVING_INTERVAL = 600, 2016, 525_600
+
+MAX_BLOCKS = 3_000_000
+BLOCK_SUBSIDY = 20 * UNIT
+MINER_SHARE = 10 * UNIT
+FUND_SHARE = BLOCK_SUBSIDY - MINER_SHARE
+MAX_MONEY = MAX_BLOCKS * BLOCK_SUBSIDY
+COINBASE_MATURITY = int(os.environ.get("XYPH_MATURITY", "5" if PROFILE == "fast" else "100"))
+MAX_BLOCK_BYTES = 1_000_000
+MAX_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+GENESIS_TAG = "Xypher genesis / XYPH / v1"
+GENESIS_TIME = 1_760_000_000
+ZERO32 = "00" * 32
+
+DATA = os.environ.get("XYPH_DATA", "./xypher-data")
+CHAIN_PATH = os.path.join(DATA, "chain.jsonl")
+KEYS_PATH = os.path.join(DATA, "wallet.json")
+TOKEN_PATH = os.path.join(DATA, "rpc.token")
+WALLET_DIR = os.environ.get("XYPH_WALLET", "./xypher-wallet")
+
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+ADDR_VERSION, WIF_VERSION = 0x58, 0xA8
+
+# =====================================================================
+# HASHING
+# =====================================================================
+def sha256(b): return hashlib.sha256(b).digest()
+def dsha256(b): return sha256(sha256(b))
+
+
+def hash160(b):
+    try:
+        h = hashlib.new("ripemd160"); h.update(sha256(b)); return h.digest()
+    except ValueError:
+        return sha256(b)[:20]
+
+
+# =====================================================================
+# BASE58
+# =====================================================================
+def b58encode(raw):
+    n, out = int.from_bytes(raw, "big"), ""
+    while n:
+        n, r = divmod(n, 58); out = B58[r] + out
+    return "1" * (len(raw) - len(raw.lstrip(b"\x00"))) + out
+
+
+def b58decode(s):
+    n = 0
+    for c in s:
+        n = n * 58 + B58.index(c)
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return b"\x00" * (len(s) - len(s.lstrip("1"))) + body
+
+
+def b58check(p): return b58encode(p + dsha256(p)[:4])
+
+
+def b58check_decode(s):
+    raw = b58decode(s)
+    payload, chk = raw[:-4], raw[-4:]
+    if dsha256(payload)[:4] != chk:
+        raise ValueError("bad checksum")
+    return payload
+
+
+# =====================================================================
+# SECP256K1 (pure Python, Jacobian coordinates)
+# =====================================================================
+P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+GX = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+GY = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+G = (GX, GY)
+INF = (0, 1, 0)
+
+
+def _jdouble(pt):
+    X, Y, Z = pt
+    if Y == 0:
+        return INF
+    yy = Y * Y % P
+    s = 4 * X * yy % P
+    m = 3 * X * X % P
+    x3 = (m * m - 2 * s) % P
+    y3 = (m * (s - x3) - 8 * yy * yy) % P
+    return (x3, y3, 2 * Y * Z % P)
+
+
+def _jadd(a, b):
+    if a[2] == 0:
+        return b
+    if b[2] == 0:
+        return a
+    x1, y1, z1 = a; x2, y2, z2 = b
+    z1z1 = z1 * z1 % P; z2z2 = z2 * z2 % P
+    u1 = x1 * z2z2 % P; u2 = x2 * z1z1 % P
+    s1 = y1 * z2 * z2z2 % P; s2 = y2 * z1 * z1z1 % P
+    if u1 == u2:
+        return _jdouble(a) if s1 == s2 else INF
+    h = (u2 - u1) % P; r = (s2 - s1) % P
+    h2 = h * h % P; h3 = h * h2 % P
+    x3 = (r * r - h3 - 2 * u1 * h2) % P
+    y3 = (r * (u1 * h2 - x3) - s1 * h3) % P
+    return (x3, y3, h * z1 * z2 % P)
+
+
+def _jmul(pt, k):
+    k %= N
+    out, add = INF, (pt[0], pt[1], 1)
+    while k:
+        if k & 1:
+            out = _jadd(out, add)
+        add = _jdouble(add)
+        k >>= 1
+    return out
+
+
+def _to_affine(j):
+    X, Y, Z = j
+    if Z == 0:
+        return None
+    zi = pow(Z, P - 2, P); zi2 = zi * zi % P
+    return (X * zi2 % P, Y * zi2 * zi % P)
+
+
+def _mul(pt, k):
+    return _to_affine(_jmul(pt, k))
+
+
+def _add(a, b):
+    if a is None: return b
+    if b is None: return a
+    x1, y1 = a; x2, y2 = b
+    if x1 == x2:
+        if (y1 + y2) % P == 0:
+            return None
+        lam = 3 * x1 * x1 % P * pow(2 * y1 % P, P - 2, P) % P
+    else:
+        lam = (y2 - y1) % P * pow((x2 - x1) % P, P - 2, P) % P
+    x3 = (lam * lam - x1 - x2) % P
+    return (x3, (lam * (x1 - x3) - y1) % P)
+
+
+def _ser(pt): return pt[0].to_bytes(32, "big") + pt[1].to_bytes(32, "big")
+
+
+def _deser(raw):
+    if len(raw) == 65 and raw[0] == 4:
+        raw = raw[1:]
+    if len(raw) != 64:
+        raise ValueError("bad public key length")
+    x = int.from_bytes(raw[:32], "big"); y = int.from_bytes(raw[32:], "big")
+    if (y * y - x * x * x - 7) % P:
+        raise ValueError("point not on curve")
+    return (x, y)
+
+
+def _der_int(i):
+    b = i.to_bytes((i.bit_length() + 7) // 8 or 1, "big")
+    if b[0] & 0x80:
+        b = b"\x00" + b
+    return b"\x02" + bytes([len(b)]) + b
+
+
+def _der(r, s):
+    body = _der_int(r) + _der_int(s)
+    return b"\x30" + bytes([len(body)]) + body
+
+
+def _under(der):
+    if len(der) < 8 or der[0] != 0x30:
+        raise ValueError("bad DER")
+    i, out = 2, []
+    for _ in range(2):
+        if der[i] != 0x02:
+            raise ValueError("bad DER")
+        ln = der[i + 1]; i += 2
+        out.append(int.from_bytes(der[i:i + ln], "big")); i += ln
+    return out[0], out[1]
+
+
+def _rfc6979_k(d, z):
+    x = d.to_bytes(32, "big"); h = z.to_bytes(32, "big")
+    v = b"\x01" * 32; k = b"\x00" * 32
+    k = hmac.new(k, v + b"\x00" + x + h, hashlib.sha256).digest()
+    v = hmac.new(k, v, hashlib.sha256).digest()
+    k = hmac.new(k, v + b"\x01" + x + h, hashlib.sha256).digest()
+    v = hmac.new(k, v, hashlib.sha256).digest()
+    while True:
+        v = hmac.new(k, v, hashlib.sha256).digest()
+        cand = int.from_bytes(v, "big")
+        if 1 <= cand < N:
+            return cand
+        k = hmac.new(k, v + b"\x00", hashlib.sha256).digest()
+        v = hmac.new(k, v, hashlib.sha256).digest()
+
+
+def sign_digest(sk, digest):
+    d = int.from_bytes(sk.to_string(), "big")
+    z = int.from_bytes(digest, "big") % N
+    while True:
+        k = _rfc6979_k(d, z)
+        R = _mul(G, k)
+        if R is None:
+            continue
+        r = R[0] % N
+        if r == 0:
+            continue
+        s = pow(k, N - 2, N) * (z + r * d) % N
+        if s == 0:
+            continue
+        if s > N // 2:
+            s = N - s
+        return _der(r, s)
+
+
+def verify_digest(pub, sig, digest):
+    try:
+        Q = _deser(pub)
+        r, s = _under(sig)
+        if not (1 <= r < N and 1 <= s < N):
+            return False
+        z = int.from_bytes(digest, "big") % N
+        w = pow(s, N - 2, N)
+        R = _add(_mul(G, z * w), _mul(Q, r * w))
+        return R is not None and R[0] % N == r
+    except Exception:
+        return False
+
+
+class Key:
+    def __init__(self, raw):
+        if len(raw) != 32:
+            raise ValueError("bad private key")
+        self.raw = raw
+
+    def to_string(self): return self.raw
+
+    def get_verifying_key(self):
+        return PubKey(_mul(G, int.from_bytes(self.raw, "big")))
+
+
+class PubKey:
+    def __init__(self, pt):
+        self.pt = pt
+
+    def to_string(self): return _ser(self.pt)
+
+
+def new_key():
+    while True:
+        raw = os.urandom(32)
+        if 1 <= int.from_bytes(raw, "big") < N:
+            return Key(raw)
+
+
+def key_to_wif(sk): return b58check(bytes([WIF_VERSION]) + sk.to_string())
+
+
+def wif_to_key(w):
+    p = b58check_decode(w)
+    if p[0] != WIF_VERSION:
+        raise ValueError("not a WIF key")
+    return Key(p[1:])
+
+
+def pubkey(sk): return sk.get_verifying_key().to_string()
+def address(sk): return b58check(bytes([ADDR_VERSION]) + hash160(pubkey(sk)))
+
+
+def is_address(a):
+    try:
+        p = b58check_decode(a)
+        return len(p) == 21 and p[0] == ADDR_VERSION
+    except Exception:
+        return False
+
+
+def sign(sk, digest): return sign_digest(sk, digest)
+def verify(pub, digest, sig): return verify_digest(pub, sig, digest)
+
+
+def merkle_root(txids):
+    if not txids:
+        return b"\x00" * 32
+    layer = [bytes.fromhex(t) for t in txids]
+    while len(layer) > 1:
+        if len(layer) % 2:
+            layer.append(layer[-1])
+        layer = [dsha256(layer[i] + layer[i + 1]) for i in range(0, len(layer), 2)]
+    return layer[0]
+
+
+# =====================================================================
+# TRANSACTIONS
+# =====================================================================
+class TxIn:
+    __slots__ = ("prev_txid", "index", "pub", "sig")
+
+    def __init__(self, prev_txid, index, pub="", sig=""):
+        self.prev_txid, self.index, self.pub, self.sig = prev_txid, index, pub, sig
+
+    def to_dict(self):
+        return {"prev_txid": self.prev_txid, "index": self.index,
+                "pub": self.pub, "sig": self.sig}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["prev_txid"], d["index"], d.get("pub", ""), d.get("sig", ""))
+
+
+class TxOut:
+    __slots__ = ("value", "addr")
+
+    def __init__(self, value, addr):
+        self.value, self.addr = value, addr
+
+    def to_dict(self): return {"value": self.value, "addr": self.addr}
+
+    @classmethod
+    def from_dict(cls, d): return cls(d["value"], d["addr"])
+
+
+class Tx:
+    def __init__(self, version=1, ins=None, outs=None):
+        self.version, self.ins, self.outs = version, ins or [], outs or []
+
+    def _stripped(self):
+        return {"v": self.version,
+                "ins": [{"prev_txid": i.prev_txid, "index": i.index} for i in self.ins],
+                "outs": [o.to_dict() for o in self.outs]}
+
+    def txid(self):
+        return dsha256(json.dumps(self._stripped(), sort_keys=True).encode()).hex()
+
+    def sighash(self, idx):
+        d = self._stripped()
+        d["ins"][idx]["pub"] = self.ins[idx].pub
+        payload = (json.dumps(d, sort_keys=True).encode() + b"|" +
+                   bytes.fromhex(self.ins[idx].prev_txid) +
+                   self.ins[idx].index.to_bytes(4, "little"))
+        return dsha256(payload)
+
+    def sign_input(self, idx, sk):
+        self.ins[idx].pub = pubkey(sk).hex()
+        self.ins[idx].sig = sign(sk, self.sighash(idx)).hex()
+
+    def verify_input(self, idx):
+        try:
+            return verify(bytes.fromhex(self.ins[idx].pub),
+                          self.sighash(idx), bytes.fromhex(self.ins[idx].sig))
+        except Exception:
+            return False
+
+    def is_coinbase(self):
+        return len(self.ins) == 1 and self.ins[0].prev_txid == ZERO32
+
+    def check_shape(self):
+        if not self.ins: return "no-inputs"
+        if not self.outs: return "no-outputs"
+        if sum(o.value for o in self.outs) > MAX_MONEY: return "output-overflow"
+        for o in self.outs:
+            if o.value < 0: return "negative-output"
+            if not is_address(o.addr): return "bad-address"
+        if not self.is_coinbase():
+            seen = set()
+            for i in self.ins:
+                k = (i.prev_txid, i.index)
+                if k in seen: return "duplicate-input"
+                seen.add(k)
+        return None
+
+    def to_dict(self):
+        return {"v": self.version,
+                "ins": [i.to_dict() for i in self.ins],
+                "outs": [o.to_dict() for o in self.outs]}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d.get("v", 1),
+                   [TxIn.from_dict(x) for x in d["ins"]],
+                   [TxOut.from_dict(x) for x in d["outs"]])
+
+
+# =====================================================================
+# BLOCKS
+# =====================================================================
+class Block:
+    def __init__(self, height, prev, txs, time=0, target=None, nonce=0, version=1):
+        self.version, self.height, self.prev = version, height, prev
+        self.txs, self.time = txs, time
+        self.target = MAX_TARGET if target is None else target
+        self.nonce = nonce
+
+    def merkle(self):
+        return merkle_root([t.txid() for t in self.txs])
+
+    def header(self):
+        return (struct.pack("<I", self.version) + self.height.to_bytes(4, "little") +
+                bytes.fromhex(self.prev) + self.merkle() +
+                struct.pack("<Q", self.time) + self.target.to_bytes(32, "big") +
+                self.nonce.to_bytes(8, "little"))
+
+    @property
+    def hash(self):
+        return dsha256(self.header()).hex()
+
+    def pow_ok(self):
+        return int(self.hash, 16) <= self.target
+
+    def size(self):
+        return len(json.dumps(self.to_dict()))
+
+    def to_dict(self):
+        return {"version": self.version, "height": self.height, "prev": self.prev,
+                "time": self.time, "target": self.target, "nonce": self.nonce,
+                "txs": [t.to_dict() for t in self.txs]}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["height"], d["prev"], [Tx.from_dict(t) for t in d["txs"]],
+                   d["time"], d["target"], d["nonce"], d.get("version", 1))
+
+
+# =====================================================================
+# CHAIN
+# =====================================================================
+class Chain:
+    def __init__(self, path, meta):
+        self.path, self.meta = path, meta
+        self.lock = threading.RLock()
+        self.all, self.utxo, self.mempool = {}, {}, {}
+        self.tip, self.height = None, -1
+
+    @classmethod
+    def open(cls, path):
+        with open(path) as f:
+            lines = [l for l in f if l.strip()]
+        c = cls(path, json.loads(lines[0])["meta"])
+        for line in lines[1:]:
+            b = Block.from_dict(json.loads(line))
+            c.all[b.hash] = b
+        err, _ = c._replay_best()
+        if err:
+            raise RuntimeError(f"corrupt chain: {err}")
+        return c
+
+    def save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps({"meta": self.meta}) + "\n")
+            for b in self.all.values():
+                f.write(json.dumps(b.to_dict()) + "\n")
+        os.replace(tmp, self.path)
+
+    def subsidy(self, height):
+        if height >= MAX_BLOCKS:
+            return 0
+        era = height // HALVING_INTERVAL
+        return 0 if era >= 64 else BLOCK_SUBSIDY >> era
+
+    def next_target(self, height):
+        if height == 0:
+            return MAX_TARGET
+        last = self.all[self.tip.hash]
+        if height % RETARGET_INTERVAL:
+            return last.target
+        first = self.tip
+        for _ in range(RETARGET_INTERVAL - 1):
+            first = self.all[first.prev]
+        actual = max(1, last.time - first.time)
+        expected = TARGET_BLOCK_TIME * RETARGET_INTERVAL
+        new = last.target * actual // expected
+        new = min(max(new, last.target // 4), last.target * 4)
+        return min(new, MAX_TARGET)
+
+    def median_time_past(self):
+        times, b = [], self.tip
+        while b and len(times) < 11:
+            times.append(b.time); b = self.all.get(b.prev)
+        times.sort()
+        return times[len(times) // 2]
+
+    def _validate_tx(self, tx, seen=None):
+        err = tx.check_shape()
+        if err:
+            return err, 0
+        if tx.is_coinbase():
+            return None, 0
+        total_in = 0
+        for i, inp in enumerate(tx.ins):
+            key = (inp.prev_txid, inp.index)
+            out = self.utxo.get(key)
+            if out is None:
+                return "missing-input", 0
+            value, _addr, h, is_cb = out
+            if is_cb and (self.height + 1) - h < COINBASE_MATURITY:
+                return "immature-coinbase", 0
+            if seen is not None:
+                if key in seen:
+                    return "double-spend-in-block", 0
+                seen.add(key)
+            if not tx.verify_input(i):
+                return "bad-signature", 0
+            total_in += value
+        total_out = sum(o.value for o in tx.outs)
+        if total_out > total_in:
+            return "overspend", 0
+        return None, total_in - total_out
+
+    def _validate_block(self, b):
+        expected_prev = ZERO32 if b.height == 0 else self.tip.hash
+        if b.prev != expected_prev: return "bad-prev"
+        if b.height != self.height + 1: return "bad-height"
+        if b.target != self.next_target(b.height): return "bad-target"
+        if not b.pow_ok(): return "bad-pow"
+        if b.merkle() != merkle_root([t.txid() for t in b.txs]): return "bad-merkle"
+        if b.size() > MAX_BLOCK_BYTES: return "too-big"
+        if b.time > int(time.time()) + 7200: return "time-too-new"
+        if b.height > 0 and b.time <= self.median_time_past(): return "time-too-old"
+        if not b.txs or not b.txs[0].is_coinbase(): return "missing-coinbase"
+        if sum(t.is_coinbase() for t in b.txs) != 1: return "multiple-coinbase"
+        if b.txs[0].ins[0].index != b.height: return "bad-coinbase-index"
+        err = b.txs[0].check_shape()
+        if err: return "bad-coinbase:" + err
+
+        fees, seen = 0, set()
+        for tx in b.txs[1:]:
+            err, fee = self._validate_tx(tx, seen)
+            if err:
+                return err
+            fees += fee
+
+        subsidy = self.subsidy(b.height)
+        if sum(o.value for o in b.txs[0].outs) > subsidy + fees:
+            return "coinbase-overpay"
+        if b.height > 0:
+            fund = subsidy - subsidy // 2
+            if fund and not any(o.addr == self.meta["fund_address"] and o.value == fund
+                                for o in b.txs[0].outs):
+                return "missing-fund-output"
+        return None
+
+    def _connect(self, b):
+        cb = b.txs[0]
+        for i, o in enumerate(cb.outs):
+            self.utxo[(cb.txid(), i)] = (o.value, o.addr, b.height, True)
+        for tx in b.txs[1:]:
+            for inp in tx.ins:
+                self.utxo.pop((inp.prev_txid, inp.index), None)
+            for i, o in enumerate(tx.outs):
+                self.utxo[(tx.txid(), i)] = (o.value, o.addr, b.height, False)
+        self.tip, self.height = b, b.height
+
+    def _best_tip(self):
+        children = {}
+        for h, b in self.all.items():
+            children.setdefault(b.prev, []).append(h)
+        genesis = next((b for b in self.all.values() if b.height == 0), None)
+        if genesis is None:
+            return None
+        best, best_work, stack = genesis, 0, [(genesis, 0)]
+        while stack:
+            b, work = stack.pop()
+            work += MAX_TARGET // b.target
+            if work > best_work:
+                best, best_work = b, work
+            for h in children.get(b.hash, []):
+                stack.append((self.all[h], work))
+        return best
+
+    def _replay_best(self):
+        tip = self._best_tip()
+        if tip is None:
+            return "empty", None
+        path, b = [], tip
+        while b:
+            path.append(b); b = self.all.get(b.prev)
+        path.reverse()
+        self.utxo, self.tip, self.height = {}, None, -1
+        for b in path:
+            err = self._validate_block(b)
+            if err:
+                return err, b
+            self._connect(b)
+        return None, None
+
+    def add_block(self, b):
+        with self.lock:
+            if b.hash in self.all:
+                return True, "duplicate"
+            self.all[b.hash] = b
+            err, _bad = self._replay_best()
+            if err:
+                self.all.pop(b.hash, None)
+                self._replay_best()
+                return False, err
+            self._prune_mempool()
+            self.save()
+            return True, "ok"
+
+    def add_tx(self, tx):
+        with self.lock:
+            if tx.is_coinbase():
+                return False, "coinbase"
+            if tx.txid() in self.mempool:
+                return True, "duplicate"
+            err, _fee = self._validate_tx(tx)
+            if err:
+                return False, err
+            spent = {(i.prev_txid, i.index) for t in self.mempool.values() for i in t.ins}
+            if any((i.prev_txid, i.index) in spent for i in tx.ins):
+                return False, "mempool-conflict"
+            self.mempool[tx.txid()] = tx
+            return True, "ok"
+
+    def _prune_mempool(self):
+        for tid, tx in list(self.mempool.items()):
+            if any((i.prev_txid, i.index) not in self.utxo for i in tx.ins):
+                del self.mempool[tid]
+
+    def balance(self, addr):
+        return sum(v for v, a, _h, _c in self.utxo.values() if a == addr)
+
+    def coins_for(self, addr):
+        return [(k, v) for k, (v, a, _h, _c) in self.utxo.items() if a == addr]
+
+    def spendable(self, addr):
+        out = []
+        for k, (value, a, h, is_cb) in self.utxo.items():
+            if a != addr:
+                continue
+            if is_cb and (self.height + 1) - h < COINBASE_MATURITY:
+                continue
+            out.append((k, value))
+        return out
+
+    def make_genesis(self):
+        cb = Tx(1, [TxIn(ZERO32, 0, "", sha256(GENESIS_TAG.encode()).hex())],
+                [TxOut(BLOCK_SUBSIDY, self.meta["fund_address"])])
+        b = Block(0, ZERO32, [cb], time=GENESIS_TIME)
+        while not b.pow_ok():
+            b.nonce += 1
+        return b
+
+
+def init_chain(data_dir):
+    os.makedirs(data_dir, exist_ok=True)
+    path = os.path.join(data_dir, "chain.jsonl")
+    if os.path.exists(path):
+        raise SystemExit("chain already initialised in " + data_dir)
+    fund = new_key()
+    meta = {"name": NAME, "symbol": SYMBOL, "profile": PROFILE,
+            "fund_address": address(fund)}
+    c = Chain(path, meta)
+    ok, msg = c.add_block(c.make_genesis())
+    if not ok:
+        raise SystemExit("genesis failed: " + msg)
+    return c, fund
+
+
+# =====================================================================
+# WALLET HELPERS
+# =====================================================================
+def load_keys(path):
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [wif_to_key(w) for w in json.load(f)["keys"]]
+
+
+def save_keys(path, keys):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"keys": [key_to_wif(k) for k in keys]}, f, indent=2)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def add_key(path, key):
+    keys = load_keys(path); keys.append(key); save_keys(path, keys)
+    return address(key)
+
+
+def build_from_coins(sk, coins, to, amount, fee):
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+    if fee < 0:
+        raise ValueError("fee must not be negative")
+    if not is_address(to):
+        raise ValueError("invalid destination address")
+    frm = address(sk)
+    need = amount + fee
+    picked, total = [], 0
+    for txid, idx, value in sorted(coins, key=lambda c: -c[2]):
+        picked.append((txid, idx)); total += value
+        if total >= need:
+            break
+    if total < need:
+        raise ValueError(f"insufficient spendable funds: have {total/UNIT:.8f} XYPH, "
+                         f"need {need/UNIT:.8f} XYPH")
+    outs = [TxOut(amount, to)]
+    if total - need:
+        outs.append(TxOut(total - need, frm))
+    tx = Tx(1, [TxIn(t, i) for t, i in picked], outs)
+    for i in range(len(tx.ins)):
+        tx.sign_input(i, sk)
+    return tx
+
+
+def build_payment(chain, sk, to, amount, fee):
+    coins = [(k[0], k[1], v) for k, v in chain.spendable(address(sk))]
+    return build_from_coins(sk, coins, to, amount, fee)
+
+
+# =====================================================================
+# MINER
+# =====================================================================
+def build_template(chain, miner_addr):
+    height = chain.height + 1
+    subsidy = chain.subsidy(height)
+    fund = chain.meta["fund_address"]
+
+    chosen, fees, spent = [], 0, set()
+    for tx in chain.mempool.values():
+        if any((i.prev_txid, i.index) in spent for i in tx.ins):
+            continue
+        try:
+            fee = (sum(chain.utxo[(i.prev_txid, i.index)][0] for i in tx.ins)
+                   - sum(o.value for o in tx.outs))
+        except KeyError:
+            continue
+        if fee < 0:
+            continue
+        chosen.append(tx); fees += fee
+        spent |= {(i.prev_txid, i.index) for i in tx.ins}
+
+    outs = [TxOut(subsidy - subsidy // 2, fund), TxOut(subsidy // 2 + fees, miner_addr)]
+    coinbase = Tx(1, [TxIn(ZERO32, height, "", sha256(b"%d" % height).hex())], outs)
+    return Block(height, chain.tip.hash, [coinbase] + chosen,
+                 time=int(time.time()) + 1, target=chain.next_target(height))
+
+
+def mine(chain, miner_addr, log_every=100_000, verbose=True, progress=None, stop=None):
+    block = build_template(chain, miner_addr)
+    start, tries = time.time(), 0
+    if verbose:
+        print(f"mining height {block.height}  target {hex(block.target)}")
+    while True:
+        if block.pow_ok():
+            elapsed = max(time.time() - start, 1e-9)
+            if verbose:
+                print(f"\nsolved: {block.hash}  {tries} hashes  {tries/elapsed:,.0f} H/s")
+            return block
+        block.nonce += 1
+        tries += 1
+        if tries % log_every == 0:
+            rate = tries / max(time.time() - start, 1e-9)
+            if progress:
+                progress(tries, rate)
+            if verbose:
+                print(f"  {tries:,} hashes  {rate:,.0f} H/s", end="\r")
+        if tries % 10_000 == 0 and stop and stop():
+            return None
+        if block.time < int(time.time()):
+            block.time = int(time.time()) + 1
+
+
+# =====================================================================
+# P2P
+# =====================================================================
+MAX_LINE = 4_000_000
+MAX_BLOCKS_PER_MSG = 200
+
+
+class Peer:
+    def __init__(self, node, sock, addr):
+        self.node, self.sock, self.addr = node, sock, addr
+        self.buf = b""
+        self.alive = True
+        self.port = None
+        self.greeted = False
+        self.synced = False
+        self.send_lock = threading.Lock()
+
+    def send(self, msg):
+        with self.send_lock:
+            try:
+                self.sock.sendall(json.dumps(msg).encode() + b"\n")
+            except OSError:
+                self.alive = False
+
+    def greet(self):
+        if not self.greeted:
+            self.greeted = True
+            self.send({"t": "hello", "port": self.node.port})
+
+    def read_loop(self):
+        while self.alive:
+            try:
+                chunk = self.sock.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.buf += chunk
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                if len(line) > MAX_LINE:
+                    self.alive = False
+                    break
+                try:
+                    self.node.dispatch(self, json.loads(line))
+                except Exception as e:
+                    print(f"peer {self.addr} bad message: {e}")
+        self.alive = False
+        self.node.drop(self)
+
+
+class Node:
+    def __init__(self, chain, port, seeds=(), rpc_port=9334, web_port=9335, web=True):
+        self.chain, self.port, self.seeds = chain, port, list(seeds)
+        self.rpc_port, self.web_port, self.web = rpc_port, web_port, web
+        self.peers, self.seen_blocks, self.seen_tx = [], set(), set()
+
+    def start(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self.port)); srv.listen(32)
+        print(f"P2P listening on :{self.port}")
+        threading.Thread(target=self._accept, args=(srv,), daemon=True).start()
+
+        rpc = RpcServer(self, self.chain, self.rpc_port)
+        rpc.start()
+        if self.web:
+            WebServer(("127.0.0.1", self.web_port), rpc).serve_in_background()
+
+        for s in self.seeds:
+            host, _, port = s.partition(":")
+            try:
+                self.connect(host, int(port))
+            except OSError as e:
+                print(f"seed {s} unreachable: {e}")
+        threading.Event().wait()
+
+    def _accept(self, srv):
+        while True:
+            sock, addr = srv.accept()
+            p = Peer(self, sock, addr)
+            self.peers.append(p)
+            threading.Thread(target=p.read_loop, daemon=True).start()
+            p.greet()
+
+    def connect(self, host, port):
+        sock = socket.create_connection((host, port), timeout=10)
+        sock.settimeout(None)
+        p = Peer(self, sock, (host, port))
+        self.peers.append(p)
+        threading.Thread(target=p.read_loop, daemon=True).start()
+        p.greet()
+        p.send({"t": "getblocks", "locator": [self.chain.tip.hash]})
+
+    def drop(self, peer):
+        if peer in self.peers:
+            self.peers.remove(peer)
+
+    def broadcast(self, msg, exclude=None):
+        for p in list(self.peers):
+            if p is not exclude:
+                p.send(msg)
+
+    def _blocks_from(self, start_height, count=MAX_BLOCKS_PER_MSG):
+        hi = min(start_height + count - 1, self.chain.height)
+        b, out = self.chain.tip, []
+        while b and b.height > hi:
+            b = self.chain.all.get(b.prev)
+        while b and b.height >= start_height:
+            out.append(b); b = self.chain.all.get(b.prev)
+        return list(reversed(out))
+
+    def dispatch(self, peer, m):
+        t = m.get("t")
+        if t == "hello":
+            peer.port = m.get("port")
+            peer.greet()
+            if not peer.synced:
+                peer.synced = True
+                peer.send({"t": "getblocks", "locator": [self.chain.tip.hash]})
+        elif t == "getblocks":
+            locator = set(m.get("locator", []))
+            start = next((b for b in self.chain.all.values() if b.hash in locator), None)
+            height = start.height if start else max(0, self.chain.height - MAX_BLOCKS_PER_MSG)
+            peer.send({"t": "blocks",
+                       "blocks": [b.to_dict() for b in self._blocks_from(height)]})
+        elif t == "blocks":
+            for d in m.get("blocks", []):
+                self.on_block(Block.from_dict(d), peer)
+        elif t == "block":
+            self.on_block(Block.from_dict(m["block"]), peer)
+        elif t == "tx":
+            self.on_tx(Tx.from_dict(m["tx"]), peer)
+        elif t == "getpeers":
+            peer.send({"t": "peers",
+                       "peers": [f"{p.addr[0]}:{p.port}" for p in self.peers if p.port]})
+
+    def on_block(self, b, peer=None):
+        if b.hash in self.seen_blocks:
+            return True, "duplicate"
+        ok, msg = self.chain.add_block(b)
+        if ok:
+            self.seen_blocks.add(b.hash)
+            print(f"block {b.height} {b.hash[:16]} ({msg})")
+            self.broadcast({"t": "block", "block": b.to_dict()}, exclude=peer)
+        else:
+            print(f"rejected block {b.height} {b.hash[:16]}: {msg}")
+        return ok, msg
+
+    def on_tx(self, tx, peer=None):
+        tid = tx.txid()
+        if tid in self.seen_tx:
+            return True, "duplicate"
+        ok, msg = self.chain.add_tx(tx)
+        if ok:
+            self.seen_tx.add(tid)
+            self.broadcast({"t": "tx", "tx": tx.to_dict()}, exclude=peer)
+        return ok, msg
+
+
+# =====================================================================
+# RPC
+# =====================================================================
+class RpcServer:
+    def __init__(self, node, chain, port):
+        self.node, self.chain, self.port = node, chain, port
+        self.token = os.urandom(16).hex()
+        self.mining = False
+        self.miner_addr = None
+        self.found = 0
+        self.hashrate = 0.0
+        self.lock = threading.Lock()
+
+    def start(self):
+        os.makedirs(DATA, exist_ok=True)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(self.token)
+        try:
+            os.chmod(TOKEN_PATH, 0o600)
+        except OSError:
+            pass
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", self.port)); srv.listen(16)
+        print(f"RPC on 127.0.0.1:{self.port}  (token: {TOKEN_PATH})")
+        threading.Thread(target=self._accept, args=(srv,), daemon=True).start()
+
+    def _accept(self, srv):
+        while True:
+            sock, _ = srv.accept()
+            threading.Thread(target=self._serve, args=(sock,), daemon=True).start()
+
+    def _serve(self, sock):
+        buf = b""
+        try:
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if len(line) > MAX_LINE:
+                        return
+                    sock.sendall((json.dumps(self._handle(json.loads(line))) + "\n").encode())
+        except Exception:
+            pass
+        finally:
+            try: sock.close()
+            except OSError: pass
+
+    def _handle(self, req):
+        rid = req.get("id")
+        if req.get("token") != self.token:
+            return {"id": rid, "error": "bad token"}
+        fn = getattr(self, "rpc_" + str(req.get("method")), None)
+        if fn is None:
+            return {"id": rid, "error": f"unknown method {req.get('method')}"}
+        try:
+            return {"id": rid, "result": fn(**(req.get("params") or {}))}
+        except TypeError as e:
+            return {"id": rid, "error": f"bad params: {e}"}
+        except Exception as e:
+            return {"id": rid, "error": str(e)}
+
+    def rpc_getinfo(self):
+        c = self.chain
+        with c.lock:
+            tgt = c.next_target(c.height + 1)
+            return {"name": NAME, "symbol": SYMBOL, "profile": PROFILE,
+                    "height": c.height, "tip": c.tip.hash,
+                    "supply": sum(v for v, *_ in c.utxo.values()),
+                    "mempool": len(c.mempool), "peers": len(self.node.peers),
+                    "blocks_left": max(0, MAX_BLOCKS - c.height),
+                    "target": tgt, "difficulty": MAX_TARGET / tgt,
+                    "maturity": COINBASE_MATURITY}
+
+    def rpc_balance(self, address):
+        c = self.chain
+        with c.lock:
+            total = c.balance(address)
+            spend = sum(v for _, v in c.spendable(address))
+            return {"total": total, "spendable": spend, "immature": total - spend}
+
+    def rpc_coins(self, address):
+        with self.chain.lock:
+            return [[k[0], k[1], v] for k, v in self.chain.spendable(address)]
+
+    def rpc_addr(self, pub):
+        return {"address": b58check(bytes([ADDR_VERSION]) + hash160(bytes.fromhex(pub)))}
+
+    def rpc_submit(self, tx):
+        t = Tx.from_dict(tx)
+        ok, msg = self.node.on_tx(t)
+        if not ok:
+            raise RuntimeError(msg)
+        return {"txid": t.txid()}
+
+    def rpc_mine_start(self, address):
+        if not is_address(address):
+            raise RuntimeError("invalid address")
+        with self.lock:
+            if self.mining:
+                raise RuntimeError("already mining")
+            self.mining, self.miner_addr, self.found = True, address, 0
+        threading.Thread(target=self._mine_loop, daemon=True).start()
+        return {"mining": True}
+
+    def rpc_mine_stop(self):
+        self.mining = False
+        return {"mining": False}
+
+    def rpc_minestatus(self):
+        return {"mining": self.mining, "address": self.miner_addr,
+                "hashrate": self.hashrate, "found": self.found}
+
+    def _mine_loop(self):
+        try:
+            while self.mining:
+                blk = mine(self.chain, self.miner_addr, verbose=False,
+                           progress=self._progress, stop=lambda: not self.mining)
+                if blk is None:
+                    break
+                ok, msg = self.node.on_block(blk)
+                if ok:
+                    self.found += 1
+                    print(f"mined {blk.height} {blk.hash[:16]}")
+                else:
+                    print(f"mined block rejected: {msg}")
+        finally:
+            self.hashrate = 0.0
+            self.mining = False
+
+    def _progress(self, hashes, rate):
+        self.hashrate = rate
+
+
+# =====================================================================
+# WEB WALLET SERVER
+# =====================================================================
+class WebHandler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.split("?")[0] not in ("/", "/index.html"):
+            return self._send(404, b"not found", "text/plain")
+        page = (PAGE.replace("__TOKEN__", self.server.rpc.token)
+                    .replace("__SYMBOL__", SYMBOL)
+                    .replace("__MATURITY__", str(COINBASE_MATURITY)))
+        self._send(200, page.encode(), "text/html; charset=utf-8")
+
+    def do_POST(self):
+        if self.path != "/rpc":
+            return self._send(404, b"not found", "text/plain")
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            req = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            req = {}
+        req["token"] = self.server.rpc.token
+        req.setdefault("id", 1)
+        out = json.dumps(self.server.rpc._handle(req)).encode()
+        self._send(200, out, "application/json")
+
+    def log_message(self, *a):
+        pass
+
+
+class WebServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+    def __init__(self, addr, rpc):
+        self.rpc = rpc
+        super().__init__(addr, WebHandler)
+
+    def serve_in_background(self):
+        url = f"http://127.0.0.1:{self.server_address[1]}/"
+        print(f"web wallet on {url}")
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+
+
+# =====================================================================
+# PAGE
+# =====================================================================
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Xypher Wallet</title>
+<style>
+:root{--bg:#0e1116;--panel:#161b23;--line:#242c38;--fg:#e6edf3;--dim:#8b98a8;--acc:#4da3ff;--ok:#2e9e4f;--bad:#c0392b}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--line);background:var(--panel)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--dim)}
+.dot.on{background:var(--ok)}.dot.off{background:var(--bad)}
+.stat{color:var(--dim);font-variant-numeric:tabular-nums}
+.stat b{color:var(--fg);font-weight:600}
+main{max-width:900px;margin:0 auto;padding:18px}
+nav{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
+nav button{background:var(--panel);border:1px solid var(--line);color:var(--dim);padding:8px 14px;border-radius:8px;cursor:pointer}
+nav button.sel{color:var(--fg);border-color:var(--acc)}
+section{display:none}section.sel{display:block}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
+.addr{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);font-family:ui-monospace,monospace;font-size:12.5px}
+.addr:last-child{border:0}
+.addr .a{flex:1;overflow-wrap:anywhere}
+.addr .b{color:var(--ok);white-space:nowrap}
+label{display:block;color:var(--dim);margin:10px 0 4px}
+input,select{width:100%;background:#0b0e13;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:9px 10px;font:inherit}
+input.mono,select.mono{font-family:ui-monospace,monospace;font-size:12.5px}
+.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1;min-width:130px}
+button.act{background:var(--acc);border:0;color:#04121f;font-weight:600;padding:10px 18px;border-radius:8px;cursor:pointer}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg);padding:8px 14px;border-radius:8px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+.hint{color:var(--dim);font-size:12.5px}
+.mono{font-family:ui-monospace,monospace}
+#log{height:220px;overflow:auto;font-family:ui-monospace,monospace;font-size:12px;color:var(--dim);white-space:pre-wrap}
+#log b{color:var(--fg)}
+.warn{color:#e8b93a}.err{color:#ff6b5e}.good{color:var(--ok)}
+</style></head><body>
+<header>
+  <div class="dot" id="dot"></div>
+  <span class="stat" id="conn">connecting…</span>
+  <span class="stat">height <b id="h">—</b></span>
+  <span class="stat">peers <b id="p">—</b></span>
+  <span class="stat">supply <b id="s">—</b></span>
+  <span class="stat" id="who" style="margin-left:auto"></span>
+</header>
+<main>
+  <nav>
+    <button data-t="wallet" class="sel">Wallet</button>
+    <button data-t="send">Send</button>
+    <button data-t="mine">Mining</button>
+    <button data-t="log">Activity</button>
+  </nav>
+
+  <section id="wallet" class="sel">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <strong>Addresses</strong>
+        <div class="row" style="flex:0">
+          <button class="ghost" id="new">New</button>
+          <button class="ghost" id="imp">Import</button>
+          <button class="ghost" id="exp">Export</button>
+        </div>
+      </div>
+      <div id="addrs" class="hint">no addresses yet</div>
+    </div>
+    <div class="card hint">
+      Keys live in this browser's localStorage. Export your WIF and keep a copy —
+      clearing site data destroys them.
+    </div>
+  </section>
+
+  <section id="send">
+    <div class="card">
+      <label>From</label>
+      <select id="from" class="mono"></select>
+      <label>To</label>
+      <input id="to" class="mono" placeholder="X…" spellcheck="false">
+      <div class="row">
+        <div><label>Amount (__SYMBOL__)</label><input id="amount" class="mono" placeholder="0.00000000"></div>
+        <div><label>Fee (__SYMBOL__)</label><input id="fee" class="mono" value="0.0001"></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="ghost" id="max">Send max</button>
+        <button class="act" id="send">Sign and send</button>
+      </div>
+      <p class="hint" id="prev"></p>
+      <p class="hint" id="res"></p>
+    </div>
+  </section>
+
+  <section id="mine">
+    <div class="card">
+      <label>Payout address</label>
+      <select id="mineaddr" class="mono"></select>
+      <div class="row" style="margin-top:12px">
+        <button class="act" id="minetoggle">Start mining</button>
+        <div class="hint" id="minestat" style="align-self:center"></div>
+      </div>
+      <p class="hint" style="margin-top:12px">
+        Blocks found are submitted and relayed immediately. Coinbase outputs need
+        __MATURITY__ confirmations before they can be spent.
+      </p>
+    </div>
+  </section>
+
+  <section id="log">
+    <div class="card"><div id="log"></div></div>
+  </section>
+</main>
+<script>
+"use strict";
+const TOKEN = "__TOKEN__";
+const UNIT = 1e8;
+const $ = id => document.getElementById(id);
+const LS = "xypher.keys";
+
+/* ---------- byte helpers ---------- */
+const hex = u => [...u].map(b => b.toString(16).padStart(2, "0")).join("");
+const unhex = h => Uint8Array.from((h.match(/../g) || []), x => parseInt(x, 16));
+const utf8 = s => new TextEncoder().encode(s);
+function cat(...as) {
+  const n = as.reduce((s, a) => s + a.length, 0), o = new Uint8Array(n);
+  let i = 0; for (const a of as) { o.set(a, i); i += a.length; } return o;
+}
+const sha = async b => new Uint8Array(await crypto.subtle.digest("SHA-256", b));
+const dsha = async b => sha(await sha(b));
+
+/* ---------- base58 ---------- */
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function b58enc(u8) {
+  let n = 0n; for (const b of u8) n = n * 256n + BigInt(b);
+  let out = ""; while (n > 0n) { out = B58[Number(n % 58n)] + out; n /= 58n; }
+  for (const b of u8) { if (b !== 0) break; out = "1" + out; }
+  return out;
+}
+function b58dec(s) {
+  let n = 0n; for (const c of s) { const i = B58.indexOf(c); if (i < 0) throw new Error("bad base58"); n = n * 58n + BigInt(i); }
+  const out = []; while (n > 0n) { out.unshift(Number(n % 256n)); n /= 256n; }
+  for (const c of s) { if (c !== "1") break; out.unshift(0); }
+  return Uint8Array.from(out);
+}
+
+/* ---------- secp256k1 ---------- */
+const P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2Fn;
+const N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141n;
+const GX = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798n;
+const GY = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8n;
+const M = x => ((x % P) + P) % P;
+const modpow = (b, e, m) => { let r = 1n; b %= m; while (e > 0n) { if (e & 1n) r = r * b % m; b = b * b % m; e >>= 1n; } return r; };
+const inv = (x, m) => modpow(x, m - 2n, m);
+const b32 = n => unhex(n.toString(16).padStart(64, "0"));
+
+function jd(a) {
+  const [X, Y, Z] = a;
+  if (Y === 0n) return [0n, 1n, 0n];
+  const yy = M(Y * Y), s = M(4n * X * yy), m = M(3n * X * X);
+  const x3 = M(m * m - 2n * s), y3 = M(m * (s - x3) - 8n * yy * yy);
+  return [x3, y3, M(2n * Y * Z)];
+}
+function ja(a, b) {
+  if (a[2] === 0n) return b;
+  if (b[2] === 0n) return a;
+  const [x1, y1, z1] = a, [x2, y2, z2] = b;
+  const z1z1 = M(z1 * z1), z2z2 = M(z2 * z2);
+  const u1 = M(x1 * z2z2), u2 = M(x2 * z1z1);
+  const s1 = M(M(y1 * z2) * z2z2), s2 = M(M(y2 * z1) * z1z1);
+  if (u1 === u2) return s1 === s2 ? jd(a) : [0n, 1n, 0n];
+  const h = M(u2 - u1), r = M(s2 - s1), h2 = M(h * h), h3 = M(h * h2);
+  const x3 = M(r * r - h3 - 2n * u1 * h2);
+  const y3 = M(r * M(u1 * h2 - x3) - s1 * h3);
+  return [x3, y3, M(M(h * z1) * z2)];
+}
+function jm(pt, k) {
+  k %= N; let out = [0n, 1n, 0n], add = [pt[0], pt[1], 1n];
+  while (k > 0n) { if (k & 1n) out = ja(out, add); add = jd(add); k >>= 1n; }
+  return out;
+}
+function aff([X, Y, Z]) {
+  if (Z === 0n) return null;
+  const zi = inv(Z, P), zi2 = M(zi * zi);
+  return [M(X * zi2), M(Y * zi2 * zi)];
+}
+function pubOf(priv) {
+  const pt = aff(jm([GX, GY], BigInt("0x" + hex(priv))));
+  return cat(b32(pt[0]), b32(pt[1]));
+}
+function derInt(n) {
+  let h = n.toString(16); if (h.length % 2) h = "0" + h;
+  let b = unhex(h);
+  if (b[0] & 0x80) b = cat(Uint8Array.of(0), b);
+  return cat(Uint8Array.of(2, b.length), b);
+}
+async function signDigest(dig, priv) {
+  const d = BigInt("0x" + hex(priv)), z = BigInt("0x" + hex(dig)) % N;
+  for (;;) {
+    let k; do { k = BigInt("0x" + hex(crypto.getRandomValues(new Uint8Array(32)))); } while (k === 0n || k >= N);
+    const R = aff(jm([GX, GY], k)); if (!R) continue;
+    const r = R[0] % N; if (r === 0n) continue;
+    let s = inv(k, N) * (z + r * d) % N; if (s === 0n) continue;
+    if (s > N / 2n) s = N - s;
+    const body = cat(derInt(r), derInt(s));
+    return cat(Uint8Array.of(0x30, body.length), body);
+  }
+}
+
+/* ---------- WIF ---------- */
+async function toWif(priv) {
+  const p = cat(Uint8Array.of(0xa8), priv);
+  return b58enc(cat(p, (await dsha(p)).slice(0, 4)));
+}
+function fromWif(w) {
+  const raw = b58dec(w.trim());
+  if (raw.length !== 37 || raw[0] !== 0xa8) throw new Error("not a WIF key");
+  const body = raw.slice(0, 33);
+  return { priv: body.slice(1) };
+}
+
+/* ---------- rpc ---------- */
+async function rpc(method, params = {}) {
+  const r = await fetch("/rpc", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: Date.now(), token: TOKEN, method, params })
+  });
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j.result;
+}
+
+/* ---------- state ---------- */
+let keys = [];
+const state = { info: null, mining: false, busy: false };
+
+const fmt = u => (u / UNIT).toFixed(8);
+function toUnits(s) {
+  const t = String(s).trim();
+  if (!/^\d*(\.\d*)?$/.test(t) || t === "" || t === ".") throw new Error("bad number");
+  const [a, b = ""] = t.split(".");
+  return Number(a || "0") * UNIT + Number((b + "00000000").slice(0, 8));
+}
+
+function log(msg, cls) {
+  const el = document.createElement("div");
+  el.innerHTML = `<b>${new Date().toLocaleTimeString()}</b> ` +
+    (cls ? `<span class="${cls}">${msg.replace(/</g, "&lt;")}</span>` : msg.replace(/</g, "&lt;"));
+  const box = $("log");
+  box.appendChild(el); box.scrollTop = box.scrollHeight;
+  while (box.children.length > 400) box.removeChild(box.firstChild);
+}
+
+async function loadKeys() {
+  const stored = JSON.parse(localStorage.getItem(LS) || "[]");
+  keys = [];
+  for (const w of stored) {
+    const { priv } = fromWif(w);
+    const pub = pubOf(priv);
+    const { address } = await rpc("addr", { pub: hex(pub) });
+    keys.push({ priv, pub, address });
+  }
+  renderAddrs();
+}
+
+function persist() {
+  localStorage.setItem(LS, JSON.stringify(keys.map(k => b58enc(cat(
+    Uint8Array.of(0xa8), k.priv, new Uint8Array(0)
+  )))));
+}
+
+async function persistAsync() {
+  const out = [];
+  for (const k of keys) out.push(await toWif(k.priv));
+  localStorage.setItem(LS, JSON.stringify(out));
+}
+
+/* ---------- tabs ---------- */
+document.querySelectorAll("nav button").forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll("nav button").forEach(x => x.classList.remove("sel"));
+    document.querySelectorAll("section").forEach(x => x.classList.remove("sel"));
+    b.classList.add("sel"); $(b.dataset.t).classList.add("sel");
+  };
+});
+
+/* ---------- addresses ---------- */
+function renderAddrs(balances = {}) {
+  const box = $("addrs");
+  box.innerHTML = "";
+  if (!keys.length) { box.className = "hint"; box.textContent = "no addresses yet"; return; }
+  box.className = "";
+  keys.forEach((k, i) => {
+    const row = document.createElement("div");
+    row.className = "addr";
+    const bal = balances[k.address] ? fmt(balances[k.address].spendable) : "…";
+    row.innerHTML = `<span class="a">${k.address}</span><span class="b">${bal}</span>`;
+    const copy = document.createElement("button");
+    copy.className = "ghost"; copy.textContent = "copy";
+    copy.onclick = () => { navigator.clipboard.writeText(k.address); log("copied " + k.address); };
+    row.appendChild(copy);
+    box.appendChild(row);
+  });
+  const opts = keys.map(k => `<option value="${k.address}">${k.address}</option>`).join("");
+  for (const id of ["from", "mineaddr"]) {
+    const keep = $(id).value;
+    $(id).innerHTML = opts;
+    if (keys.some(k => k.address === keep)) $(id).value = keep;
+  }
+}
+
+$("new").onclick = async () => {
+  const priv = crypto.getRandomValues(new Uint8Array(32));
+  const pub = pubOf(priv);
+  const { address } = await rpc("addr", { pub: hex(pub) });
+  keys.push({ priv, pub, address });
+  await persistAsync(); renderAddrs();
+  log("created " + address, "good");
+  poll();
+};
+
+$("imp").onclick = async () => {
+  const w = prompt("Paste a WIF private key:");
+  if (!w) return;
+  try {
+    const { priv } = fromWif(w);
+    const pub = pubOf(priv);
+    const { address } = await rpc("addr", { pub: hex(pub) });
+    if (keys.some(k => k.address === address)) return log("already imported", "warn");
+    keys.push({ priv, pub, address });
+    await persistAsync(); renderAddrs();
+    log("imported " + address, "good");
+  } catch (e) { log("import failed: " + e.message, "err"); }
+};
+
+$("exp").onclick = async () => {
+  if (!keys.length) return;
+  const out = [];
+  for (const k of keys) out.push(k.address + "\n" + await toWif(k.priv));
+  prompt("Private keys — copy and store offline:", out.join("\n\n"));
+};
+
+/* ---------- send ---------- */
+$("amount").oninput = $("fee").oninput = () => {
+  try {
+    const a = toUnits($("amount").value || "0"), f = toUnits($("fee").value || "0");
+    $("prev").textContent = `total ${fmt(a + f)} __SYMBOL__`;
+  } catch { $("prev").textContent = "invalid number"; }
+};
+
+$("max").onclick = async () => {
+  const ad = $("from").value;
+  if (!ad) return;
+  try {
+    const b = await rpc("balance", { address: ad });
+    const fee = toUnits($("fee").value || "0");
+    $("amount").value = fmt(Math.max(0, b.spendable - fee));
+    $("amount").oninput();
+  } catch (e) { log("max failed: " + e.message, "err"); }
+};
+
+async function canonical(tx, pubIdx) {
+  const ins = "[" + tx.ins.map((i, n) =>
+    `{"index": ${i.index}, "prev_txid": "${i.prev_txid}"` +
+    (n === pubIdx ? `, "pub": "${i.pub}"` : "") + "}"
+  ).join(", ") + "]";
+  const outs = "[" + tx.outs.map(o =>
+    `{"addr": "${o.addr}", "value": ${o.value}}`).join(", ") + "]";
+  return `{"ins": ${ins}, "outs": ${outs}, "v": ${tx.v}}`;
+}
+
+async function sighash(tx, idx) {
+  const le = new Uint8Array(4);
+  new DataView(le.buffer).setUint32(0, tx.ins[idx].index, true);
+  return dsha(cat(utf8(await canonical(tx, idx)), Uint8Array.of(0x7c),
+                  unhex(tx.ins[idx].prev_txid), le));
+}
+
+async function buildTx(sk, coins, to, amount, fee) {
+  const need = amount + fee;
+  coins.sort((a, b) => b[2] - a[2]);
+  const picked = []; let total = 0;
+  for (const c of coins) { picked.push(c); total += c[2]; if (total >= need) break; }
+  if (total < need) throw new Error(`insufficient funds: have ${fmt(total)}, need ${fmt(need)}`);
+  const tx = { v: 1, ins: picked.map(c => ({ prev_txid: c[0], index: c[1], pub: "", sig: "" })),
+               outs: [{ addr: to, value: amount }] };
+  if (total - need > 0) tx.outs.push({ addr: sk.address, value: total - need });
+  for (let i = 0; i < tx.ins.length; i++) {
+    tx.ins[i].pub = hex(sk.pub);
+    tx.ins[i].sig = hex(await signDigest(await sighash(tx, i), sk.priv));
+  }
+  return tx;
+}
+
+$("send").onclick = async () => {
+  if (state.busy) return;
+  const ad = $("from").value, to = $("to").value.trim();
+  const sk = keys.find(k => k.address === ad);
+  if (!sk) return ($("res").textContent = "no source address");
+  try {
+    const amount = toUnits($("amount").value), fee = toUnits($("fee").value || "0");
+    if (amount <= 0) throw new Error("amount must be positive");
+    state.busy = true; $("send").disabled = true;
+    $("res").textContent = "signing…";
+    const coins = await rpc("coins", { address: ad });
+    const tx = await buildTx(sk, coins, to, amount, fee);
+    const r = await rpc("submit", { tx });
+    $("res").textContent = "accepted " + r.txid;
+    log("sent " + fmt(amount) + " to " + to + " — " + r.txid, "good");
+    $("amount").value = ""; $("prev").textContent = "";
+  } catch (e) {
+    $("res").textContent = "failed: " + e.message;
+    log("send failed: " + e.message, "err");
+  } finally { state.busy = false; $("send").disabled = false; poll(); }
+};
+
+/* ---------- mining ---------- */
+$("minetoggle").onclick = async () => {
+  try {
+    if (state.mining) { await rpc("mine_stop"); log("mining stopped", "warn"); }
+    else {
+      const ad = $("mineaddr").value;
+      if (!ad) throw new Error("no payout address");
+      await rpc("mine_start", { address: ad });
+      log("mining to " + ad, "good");
+    }
+  } catch (e) { log("mining error: " + e.message, "err"); }
+  poll();
+};
+
+/* ---------- polling ---------- */
+async function poll() {
+  try {
+    const info = await rpc("getinfo");
+    const ms = await rpc("minestatus");
+    state.info = info; state.mining = ms.mining;
+    $("dot").className = "dot on"; $("conn").textContent = "connected";
+    $("h").textContent = info.height.toLocaleString();
+    $("p").textContent = info.peers;
+    $("s").textContent = fmt(info.supply);
+    $("who").textContent = `${info.name} · ${info.profile}`;
+    $("minetoggle").textContent = ms.mining ? "Stop mining" : "Start mining";
+    $("minestat").textContent = ms.mining
+      ? `${Math.round(ms.hashrate).toLocaleString()} H/s · found ${ms.found}` : "";
+    const bal = {};
+    for (const k of keys) bal[k.address] = await rpc("balance", { address: k.address });
+    renderAddrs(bal);
+  } catch (e) {
+    $("dot").className = "dot off";
+    $("conn").textContent = "node unreachable";
+  }
+  setTimeout(poll, 3000);
+}
+
+/* ---------- boot ---------- */
+loadKeys().then(() => { log("wallet ready"); poll(); })
+  .catch(e => { log("boot failed: " + e.message, "err"); poll(); });
+</script></body></html>
+"""
+
+
+# =====================================================================
+# GUI WALLET (Tkinter)
+# =====================================================================
+class Rpc:
+    def __init__(self, host, port, token):
+        self.host, self.port, self.token = host, port, token
+
+    def call(self, method, **params):
+        req = {"id": 1, "token": self.token, "method": method, "params": params}
+        with socket.create_connection((self.host, self.port), timeout=20) as s:
+            s.sendall(json.dumps(req).encode() + b"\n")
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        r = json.loads(buf.split(b"\n")[0])
+        if "error" in r:
+            raise RuntimeError(r["error"])
+        return r.get("result")
+
+
+class Wallet:
+    def __init__(self, path):
+        self.path = path
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        self.keys = load_keys(path)
+
+    def new(self):
+        k = new_key()
+        self.keys.append(k)
+        save_keys(self.path, self.keys)
+        return address(k)
+
+
+def cmd_wallet(a):
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except ImportError:
+        raise SystemExit("tkinter missing — Debian/Ubuntu: sudo apt install python3-tk")
+    if not os.path.exists(a.token_file):
+        raise SystemExit(f"no RPC token at {a.token_file} — start the node first")
+    with open(a.token_file) as f:
+        token = f.read().strip()
+    w = Wallet(os.path.join(a.wallet_dir, "keys.json"))
+    if not w.keys:
+        w.new()
+    root = tk.Tk()
+    WalletApp(root, Rpc(a.rpc_host, a.rpc_port, token), w, tk, ttk)
+    root.mainloop()
+
+
+class WalletApp:
+    POLL = 2500
+
+    def __init__(self, root, rpc, wallet, tk, ttk):
+        self.root, self.rpc, self.wallet = root, rpc, wallet
+        self.tk, self.ttk = tk, ttk
+        self.q = queue.Queue()
+        self.mining = False
+        self.busy = False
+        root.title(f"Xypher Wallet — {SYMBOL}")
+        root.geometry("900x600")
+        self._build()
+        self._drain()
+        self._poll()
+        self.log(f"{len(wallet.keys)} key(s) loaded")
+
+    def _build(self):
+        tk, ttk = self.tk, self.ttk
+        bar = ttk.Frame(self.root, padding=(10, 8)); bar.pack(fill="x")
+        self.dot = tk.Canvas(bar, width=12, height=12, highlightthickness=0)
+        self.dot_id = self.dot.create_oval(2, 2, 11, 11, fill="#999"); self.dot.pack(side="left")
+        self.state_lbl = ttk.Label(bar, text="connecting…"); self.state_lbl.pack(side="left", padx=6)
+        self.height_lbl = ttk.Label(bar, text="height —"); self.height_lbl.pack(side="left", padx=6)
+        self.peers_lbl = ttk.Label(bar, text="peers —"); self.peers_lbl.pack(side="left", padx=6)
+        self.supply_lbl = ttk.Label(bar, text="supply —"); self.supply_lbl.pack(side="left", padx=6)
+        ttk.Button(bar, text="Refresh", command=self._poll).pack(side="right")
+
+        nb = ttk.Notebook(self.root); nb.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        tab = ttk.Frame(nb, padding=10); nb.add(tab, text="Addresses")
+        self.addr_tree = ttk.Treeview(tab, columns=("a", "b"), show="headings", height=12)
+        self.addr_tree.heading("a", text="Address"); self.addr_tree.heading("b", text="Spendable")
+        self.addr_tree.column("a", width=580, anchor="w"); self.addr_tree.column("b", width=140, anchor="e")
+        self.addr_tree.pack(fill="both", expand=True)
+        self.addr_tree.bind("<<TreeviewSelect>>", self._on_select)
+        row = ttk.Frame(tab); row.pack(fill="x", pady=(8, 0))
+        ttk.Button(row, text="New address", command=self._new_addr).pack(side="left")
+        ttk.Button(row, text="Copy", command=self._copy).pack(side="left", padx=6)
+
+        tab = ttk.Frame(nb, padding=10); nb.add(tab, text="Send")
+        f = ttk.Frame(tab); f.pack(fill="x", pady=4)
+        ttk.Label(f, text="From", width=8).pack(side="left")
+        self.from_var = tk.StringVar()
+        self.from_box = ttk.Combobox(f, textvariable=self.from_var, state="readonly")
+        self.from_box.pack(side="left", fill="x", expand=True)
+        f = ttk.Frame(tab); f.pack(fill="x", pady=4)
+        ttk.Label(f, text="To", width=8).pack(side="left")
+        self.to_var = tk.StringVar(); ttk.Entry(f, textvariable=self.to_var).pack(side="left", fill="x", expand=True)
+        f = ttk.Frame(tab); f.pack(fill="x", pady=4)
+        ttk.Label(f, text="Amount", width=8).pack(side="left")
+        self.amount_var = tk.StringVar(); ttk.Entry(f, textvariable=self.amount_var, width=22).pack(side="left")
+        ttk.Button(f, text="Max", command=self._max).pack(side="left", padx=6)
+        ttk.Label(f, text="Fee").pack(side="left", padx=(14, 4))
+        self.fee_var = tk.StringVar(value="0.0001"); ttk.Entry(f, textvariable=self.fee_var, width=14).pack(side="left")
+        self.prev_lbl = ttk.Label(tab, text=""); self.prev_lbl.pack(anchor="w", pady=(10, 0))
+        ttk.Button(tab, text="Send payment", command=self._send).pack(anchor="w", pady=10)
+        self.res_lbl = ttk.Label(tab, text="", wraplength=820); self.res_lbl.pack(anchor="w")
+        self.amount_var.trace_add("write", lambda *_: self._preview())
+        self.fee_var.trace_add("write", lambda *_: self._preview())
+
+        tab = ttk.Frame(nb, padding=10); nb.add(tab, text="Mining")
+        f = ttk.Frame(tab); f.pack(fill="x", pady=4)
+        ttk.Label(f, text="Payout", width=8).pack(side="left")
+        self.mine_var = tk.StringVar()
+        self.mine_box = ttk.Combobox(f, textvariable=self.mine_var, state="readonly")
+        self.mine_box.pack(side="left", fill="x", expand=True)
+        row = ttk.Frame(tab); row.pack(fill="x", pady=8)
+        self.mine_btn = ttk.Button(row, text="Start mining", command=self._toggle_mine)
+        self.mine_btn.pack(side="left")
+        self.hash_lbl = ttk.Label(row, text="— H/s"); self.hash_lbl.pack(side="left", padx=16)
+        self.found_lbl = ttk.Label(row, text="found: 0"); self.found_lbl.pack(side="left")
+
+        tab = ttk.Frame(nb, padding=10); nb.add(tab, text="Activity")
+        self.log_widget = tk.Text(tab, height=14, wrap="word", state="disabled")
+        self.log_widget.pack(fill="both", expand=True)
+
+    def log(self, msg):
+        self.log_widget.configure(state="normal")
+        self.log_widget.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        self.log_widget.see("end"); self.log_widget.configure(state="disabled")
+
+    def _set_state(self, ok, text):
+        self.dot.itemconfigure(self.dot_id, fill="#2e9e4f" if ok else "#c0392b")
+        self.state_lbl.configure(text=text)
+
+    def _async(self, work, done):
+        def run():
+            try: self.q.put((done, work(), None))
+            except Exception as e: self.q.put((done, None, e))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _drain(self):
+        while True:
+            try: done, res, err = self.q.get_nowait()
+            except queue.Empty: break
+            try: done(res, err)
+            except Exception as e: self.log(f"ui error: {e}")
+        self.root.after(120, self._drain)
+
+    def _key_for(self, addr):
+        for k in self.wallet.keys:
+            if address(k) == addr:
+                return k
+
+    def _poll(self):
+        addrs = [address(k) for k in self.wallet.keys]
+        def work():
+            out = {"info": self.rpc.call("getinfo"), "mine": self.rpc.call("minestatus"), "bal": {}}
+            for ad in addrs:
+                out["bal"][ad] = self.rpc.call("balance", address=ad)
+            return out
+        self._async(work, self._apply)
+        self.root.after(self.POLL, self._poll)
+
+    def _apply(self, res, err):
+        if err:
+            self._set_state(False, f"node unreachable — {err}")
+            return
+        i = res["info"]
+        self._set_state(True, "connected")
+        self.height_lbl.configure(text=f"height {i['height']:,}")
+        self.peers_lbl.configure(text=f"peers {i['peers']}")
+        self.supply_lbl.configure(text=f"supply {i['supply']/UNIT:,.2f} {SYMBOL}")
+        sel = self.addr_tree.selection()
+        keep = self.addr_tree.item(sel[0])["values"][0] if sel else None
+        self.addr_tree.delete(*self.addr_tree.get_children())
+        for ad, b in res["bal"].items():
+            self.addr_tree.insert("", "end", values=(ad, f"{b['spendable']/UNIT:.8f}"))
+        vals = list(res["bal"].keys())
+        self.from_box["values"] = vals; self.mine_box["values"] = vals
+        if not self.from_var.get() and vals: self.from_var.set(vals[0])
+        if not self.mine_var.get() and vals: self.mine_var.set(vals[0])
+        m = res["mine"]
+        self.mining = m["mining"]
+        self.mine_btn.configure(text="Stop mining" if self.mining else "Start mining")
+        self.hash_lbl.configure(text=f"{m['hashrate']:,.0f} H/s" if self.mining else "— H/s")
+        self.found_lbl.configure(text=f"found: {m['found']}")
+
+    def _new_addr(self):
+        ad = self.wallet.new(); self.log(f"new address {ad}"); self._poll()
+
+    def _selected(self):
+        sel = self.addr_tree.selection()
+        return self.addr_tree.item(sel[0])["values"][0] if sel else None
+
+    def _copy(self):
+        ad = self._selected()
+        if ad:
+            self.root.clipboard_clear(); self.root.clipboard_append(ad); self.log(f"copied {ad}")
+
+    def _on_select(self, _e):
+        ad = self._selected()
+        if ad:
+            self.from_var.set(ad); self.mine_var.set(ad); self._preview()
+
+    def _preview(self):
+        try:
+            a = Decimal(self.amount_var.get() or "0"); f = Decimal(self.fee_var.get() or "0")
+            self.prev_lbl.configure(text=f"{a:.8f} + {f:.8f} fee = {a + f:.8f} {SYMBOL}")
+        except Exception:
+            self.prev_lbl.configure(text="invalid number")
+
+    def _max(self):
+        ad = self.from_var.get()
+        if not ad: return
+        try:
+            b = self.rpc.call("balance", address=ad)["spendable"]
+            self.amount_var.set(f"{max(0, b - to_units(self.fee_var.get() or '0'))/UNIT:.8f}")
+        except Exception as e:
+            self.log(f"max failed: {e}")
+
+    def _send(self):
+        if self.busy: return
+        ad, to = self.from_var.get(), self.to_var.get().strip()
+        sk = self._key_for(ad)
+        if not sk: return self.res_lbl.configure(text="select a source address")
+        try:
+            amount, fee = to_units(self.amount_var.get()), to_units(self.fee_var.get())
+        except Exception:
+            return self.res_lbl.configure(text="invalid amount")
+        def work():
+            coins = self.rpc.call("coins", address=ad)
+            tx = build_from_coins(sk, coins, to, amount, fee)
+            return self.rpc.call("submit", tx=tx.to_dict())
+        self.busy = True; self.res_lbl.configure(text="signing…")
+        self._async(work, self._sent)
+
+    def _sent(self, res, err):
+        self.busy = False
+        if err:
+            self.res_lbl.configure(text=f"failed: {err}"); self.log(f"send failed: {err}"); return
+        self.res_lbl.configure(text=f"accepted: {res['txid']}"); self.log(f"broadcast {res['txid']}")
+        self.amount_var.set(""); self._poll()
+
+    def _toggle_mine(self):
+        ad = self.mine_var.get()
+        if not ad: return self.log("choose a payout address")
+        was = self.mining
+        def work():
+            return self.rpc.call("mine_stop") if was else self.rpc.call("mine_start", address=ad)
+        self._async(work, lambda r, e: self.log(
+            f"mining {'stopped' if was else 'started'}" if not e else f"mining error: {e}"))
+
+
+# =====================================================================
+# CLI
+# =====================================================================
+def to_units(s):
+    return int((Decimal(str(s)) * UNIT).to_integral_value())
+
+
+def show(units):
+    return f"{Decimal(units) / UNIT:.8f}"
+
+
+def open_chain():
+    if not os.path.exists(CHAIN_PATH):
+        raise SystemExit(f"no chain in {DATA} — run: python xypher.py init")
+    return Chain.open(CHAIN_PATH)
+
+
+def cmd_init(a):
+    _, fund = init_chain(DATA)
+    save_keys(KEYS_PATH, [fund])
+    print(f"chain initialised in {DATA}")
+    print(f"fund address: {address(fund)}")
+    print(f"fund WIF saved to {KEYS_PATH} — back this up")
+
+
+def cmd_address(a):
+    if a.action == "new":
+        print(add_key(KEYS_PATH, new_key()))
+    else:
+        for k in load_keys(KEYS_PATH):
+            print(address(k))
+
+
+def cmd_balance(a):
+    c = open_chain()
+    imm = c.balance(a.address) - sum(v for _, v in c.spendable(a.address))
+    print(f"{a.address}: {show(c.balance(a.address))} XYPH ({show(imm)} immature)")
+
+
+def cmd_info(a):
+    c = open_chain()
+    print(f"{NAME} ({SYMBOL}) profile={PROFILE}")
+    print(f"height {c.height}  tip {c.tip.hash}")
+    print(f"supply {show(sum(v for v, *_ in c.utxo.values()))} XYPH")
+    print(f"next subsidy {show(c.subsidy(c.height + 1))} XYPH  "
+          f"blocks left to cap {max(0, MAX_BLOCKS - c.height)}")
+    print(f"next target {hex(c.next_target(c.height + 1))}")
+    print(f"mempool {len(c.mempool)} tx")
+
+
+def cmd_send(a):
+    c = open_chain()
+    keys = {address(k): k for k in load_keys(KEYS_PATH)}
+    if a.sender not in keys:
+        raise SystemExit("sender not in wallet")
+    tx = build_payment(c, keys[a.sender], a.to, to_units(a.amount), to_units(a.fee))
+    ok, msg = c.add_tx(tx)
+    print(f"{tx.txid()} -> {msg}")
+
+
+def cmd_mine(a):
+    c = open_chain()
+    start = c.height
+    while True:
+        b = mine(c, a.to)
+        ok, msg = c.add_block(b)
+        print(f"block {b.height} accepted: {msg}\n")
+        if a.blocks and b.height - start >= a.blocks:
+            return
+
+
+def cmd_validate(a):
+    c = open_chain()
+    print(f"valid, height {c.height}, {len(c.utxo)} utxos")
+
+
+def cmd_node(a):
+    Node(open_chain(), a.port, a.seed, a.rpc_port, a.web_port, not a.no_web).start()
+
+
+def cmd_webwallet(a):
+    url = f"http://127.0.0.1:{a.web_port}/"
+    try:
+        urllib.request.urlopen(url, timeout=4).read()
+    except Exception:
+        raise SystemExit(f"no web wallet at {url} — is the node running?")
+    print(f"opening {url}")
+    webbrowser.open(url)
+
+
+def cmd_selftest(a):
+    global COINBASE_MATURITY
+    saved = COINBASE_MATURITY
+    COINBASE_MATURITY = 3
+    d = tempfile.mkdtemp()
+    try:
+        one = Key(b"\x00" * 31 + b"\x01")
+        assert pubkey(one) == GX.to_bytes(32, "big") + GY.to_bytes(32, "big")
+        dg = sha256(b"xypher"); sg = sign(one, dg)
+        assert verify(pubkey(one), dg, sg)
+        assert not verify(pubkey(one), sha256(b"other"), sg)
+        bad = bytearray(sg); bad[-2] ^= 0x01
+        assert not verify(pubkey(one), dg, bytes(bad))
+        print("crypto vectors ok")
+
+        chain, fund = init_chain(d)
+        keys = os.path.join(d, "wallet.json")
+        save_keys(keys, [fund])
+        a_addr = add_key(keys, new_key())
+        b_addr = address(new_key())
+        fund_addr = chain.meta["fund_address"]
+
+        for _ in range(5):
+            ok, msg = chain.add_block(mine(chain, a_addr, log_every=10 ** 9))
+            assert ok, msg
+        assert chain.balance(a_addr) == 5 * MINER_SHARE
+        assert chain.balance(fund_addr) == 5 * (BLOCK_SUBSIDY - MINER_SHARE)
+        assert len(chain.spendable(a_addr)) == 3
+        print("mining + split + maturity ok")
+
+        sk = load_keys(keys)[0]
+        tx = build_payment(chain, sk, b_addr, 3 * UNIT, UNIT // 100)
+        assert chain.add_tx(tx)[0]
+        ok, msg = chain.add_tx(build_payment(chain, sk, b_addr, 2 * UNIT, UNIT // 100))
+        assert not ok and msg == "mempool-conflict"
+        print("double-spend rejected ok")
+
+        assert chain.add_block(mine(chain, a_addr, log_every=10 ** 9))[0]
+        assert chain.balance(b_addr) == 3 * UNIT
+        print("payment confirmed ok")
+
+        tx3 = build_payment(chain, sk, b_addr, UNIT, 1000)
+        tx3.ins[0].sig = "00" * 8
+        ok, msg = chain.add_tx(tx3)
+        assert not ok and msg == "bad-signature"
+        print("bad signature rejected ok")
+
+        blk = mine(chain, a_addr, log_every=10 ** 9); blk.target //= 2
+        ok, msg = chain.add_block(blk)
+        assert not ok and msg == "bad-target"
+        print("wrong target rejected ok")
+
+        try:
+            build_payment(chain, sk, b_addr, 10_000 * UNIT, 0); raise AssertionError
+        except ValueError:
+            print("overspend rejected ok")
+
+        assert Chain.open(os.path.join(d, "chain.jsonl")).height == chain.height
+        print("persistence ok")
+
+        fake = type("N", (), {"peers": [], "on_tx": lambda s, t, p=None: chain.add_tx(t),
+                              "on_block": lambda s, b, p=None: chain.add_block(b),
+                              "broadcast": lambda *x, **y: None})()
+        rpc = RpcServer(fake, chain, 0)
+        r = rpc._handle({"id": 1, "token": rpc.token, "method": "balance",
+                         "params": {"address": b_addr}})
+        assert r["result"]["total"] == 3 * UNIT, r
+        assert rpc._handle({"id": 2, "token": rpc.token, "method": "addr",
+                            "params": {"pub": pubkey(one).hex()}})["result"]["address"] == address(one)
+        assert "error" in rpc._handle({"id": 3, "token": "nope", "method": "getinfo"})
+        print("rpc ok")
+
+        web = WebServer(("127.0.0.1", 0), rpc)
+        threading.Thread(target=web.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{web.server_address[1]}"
+        page = urllib.request.urlopen(base + "/", timeout=5).read().decode()
+        assert rpc.token in page and "Xypher" in page
+        req = urllib.request.Request(
+            base + "/rpc", data=json.dumps({"method": "balance",
+                                            "params": {"address": b_addr}}).encode(),
+            headers={"Content-Type": "application/json"})
+        assert json.loads(urllib.request.urlopen(req, timeout=5).read())["result"]["total"] == 3 * UNIT
+        web.shutdown()
+        print("web wallet ok\nALL PASS")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        COINBASE_MATURITY = saved
+
+
+def main():
+    if os.path.isdir("xypher") and os.path.basename(sys.argv[0]).endswith(".py"):
+        print("note: a ./xypher/ directory exists; python -m xypher would load that instead",
+              file=sys.stderr)
+    p = argparse.ArgumentParser(
+        prog="xypher", description="Xypher (XYPH) node and wallets",
+        epilog="run 'xypher <command> -h' for command options")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("init", help="create a new chain").set_defaults(fn=cmd_init)
+    s = sub.add_parser("address", help="create or list node-wallet addresses")
+    s.add_argument("action", choices=["new", "list"]); s.set_defaults(fn=cmd_address)
+    s = sub.add_parser("balance", help="show an address balance")
+    s.add_argument("address"); s.set_defaults(fn=cmd_balance)
+    sub.add_parser("info", help="chain height, supply, target").set_defaults(fn=cmd_info)
+    sub.add_parser("status", help="alias for info").set_defaults(fn=cmd_info)
+    s = sub.add_parser("send", help="send from the node wallet")
+    s.add_argument("--from", dest="sender", required=True)
+    s.add_argument("--to", required=True)
+    s.add_argument("--amount", required=True)
+    s.add_argument("--fee", default="0.0001")
+    s.set_defaults(fn=cmd_send)
+    s = sub.add_parser("mine", help="mine blocks")
+    s.add_argument("--to", required=True)
+    s.add_argument("--blocks", type=int, default=0)
+    s.set_defaults(fn=cmd_mine)
+    sub.add_parser("validate", help="replay and verify the chain").set_defaults(fn=cmd_validate)
+    sub.add_parser("selftest", help="run the built-in end-to-end test").set_defaults(fn=cmd_selftest)
+    s = sub.add_parser("node", help="run the chain, P2P, RPC and web wallet")
+    s.add_argument("--port", type=int, default=9333)
+    s.add_argument("--rpc-port", type=int, default=9334)
+    s.add_argument("--web-port", type=int, default=9335)
+    s.add_argument("--no-web", action="store_true")
+    s.add_argument("--seed", action="append", default=[])
+    s.set_defaults(fn=cmd_node)
+    s = sub.add_parser("wallet", help="open the Tkinter wallet")
+    s.add_argument("--rpc-host", default="127.0.0.1")
+    s.add_argument("--rpc-port", type=int, default=9334)
+    s.add_argument("--token-file", default=TOKEN_PATH)
+    s.add_argument("--wallet-dir", default=WALLET_DIR)
+    s.set_defaults(fn=cmd_wallet)
+    s = sub.add_parser("webwallet", help="open the browser wallet")
+    s.add_argument("--web-port", type=int, default=9335)
+    s.set_defaults(fn=cmd_webwallet)
+
+    a = p.parse_args()
+    if not getattr(a, "fn", None):
+        p.print_help()
+        print()
+        if os.path.exists(CHAIN_PATH):
+            try: cmd_info(a)
+            except SystemExit: pass
+        else:
+            print(f"no chain in {DATA} — start with: python {os.path.basename(sys.argv[0])} init")
+        return
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
+

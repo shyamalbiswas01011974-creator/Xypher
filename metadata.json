@@ -1,0 +1,10 @@
+{
+  "name": "Xypher Private Blockchain & Wallet",
+  "description": "Manage secp256k1 wallets, sign UTXO transactions, mine Proof-of-Work blocks, and inspect a private Xypher (XYPH) cryptocurrency network.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
